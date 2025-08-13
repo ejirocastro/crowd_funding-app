@@ -571,3 +571,225 @@
 (define-read-only (get-admin-permissions (admin principal))
     (map-get? admin-permissions admin)
 )
+;; Decentralized Governance System
+
+;; Governance Constants
+(define-constant err-voting-period-ended (err u117))
+(define-constant err-voting-period-active (err u118))
+(define-constant err-already-voted (err u119))
+(define-constant err-proposal-not-found (err u120))
+(define-constant err-insufficient-voting-power (err u121))
+
+;; Governance Data Variables
+(define-data-var governance-enabled bool false)
+(define-data-var proposal-counter uint u0)
+(define-data-var min-voting-power uint u1000000000) ;; 1000 STX minimum
+
+;; Governance Data Maps
+(define-map governance-proposals
+    uint
+    {
+        proposer: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        proposal-type: (string-ascii 50),
+        target-value: uint,
+        start-block: uint,
+        end-block: uint,
+        votes-for: uint,
+        votes-against: uint,
+        total-voting-power: uint,
+        executed: bool,
+    }
+)
+
+(define-map proposal-votes
+    {
+        proposal-id: uint,
+        voter: principal,
+    }
+    {
+        power: uint,
+        vote: bool,
+        block-height: uint,
+    }
+)
+
+(define-map user-voting-power
+    principal
+    uint
+)
+
+;; Governance Functions
+(define-public (create-governance-proposal
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (proposal-type (string-ascii 50))
+        (target-value uint)
+        (voting-period uint)
+    )
+    (let (
+            (proposal-id (+ (var-get proposal-counter) u1))
+            (user-power (get-user-voting-power tx-sender))
+        )
+        (asserts! (var-get governance-enabled) err-unauthorized)
+        (asserts! (>= user-power (var-get min-voting-power))
+            err-insufficient-voting-power
+        )
+        (asserts! (> voting-period u0) err-invalid-duration)
+        (asserts! (<= voting-period u14400) err-invalid-duration)
+        ;; Max 100 days
+
+        (map-set governance-proposals proposal-id {
+            proposer: tx-sender,
+            title: title,
+            description: description,
+            proposal-type: proposal-type,
+            target-value: target-value,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height voting-period),
+            votes-for: u0,
+            votes-against: u0,
+            total-voting-power: u0,
+            executed: false,
+        })
+
+        (var-set proposal-counter proposal-id)
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-on-proposal
+        (proposal-id uint)
+        (vote bool)
+    )
+    (let (
+            (proposal (unwrap! (map-get? governance-proposals proposal-id)
+                err-proposal-not-found
+            ))
+            (user-power (get-user-voting-power tx-sender))
+            (existing-vote (map-get? proposal-votes {
+                proposal-id: proposal-id,
+                voter: tx-sender,
+            }))
+        )
+        (asserts! (var-get governance-enabled) err-unauthorized)
+        (asserts! (> user-power u0) err-insufficient-voting-power)
+        (asserts! (< stacks-block-height (get end-block proposal))
+            err-voting-period-ended
+        )
+        (asserts! (is-none existing-vote) err-already-voted)
+
+        ;; Record vote
+        (map-set proposal-votes {
+            proposal-id: proposal-id,
+            voter: tx-sender,
+        } {
+            power: user-power,
+            vote: vote,
+            block-height: stacks-block-height,
+        })
+
+        ;; Update proposal vote counts
+        (if vote
+            (map-set governance-proposals proposal-id
+                (merge proposal {
+                    votes-for: (+ (get votes-for proposal) user-power),
+                    total-voting-power: (+ (get total-voting-power proposal) user-power),
+                })
+            )
+            (map-set governance-proposals proposal-id
+                (merge proposal {
+                    votes-against: (+ (get votes-against proposal) user-power),
+                    total-voting-power: (+ (get total-voting-power proposal) user-power),
+                })
+            )
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let ((proposal (unwrap! (map-get? governance-proposals proposal-id)
+            err-proposal-not-found
+        )))
+        (asserts! (var-get governance-enabled) err-unauthorized)
+        (asserts! (>= stacks-block-height (get end-block proposal))
+            err-voting-period-active
+        )
+        (asserts! (not (get executed proposal)) err-proposal-not-found)
+        (asserts! (> (get votes-for proposal) (get votes-against proposal))
+            err-insufficient-voting-power
+        )
+
+        ;; Execute based on proposal type
+        (if (is-eq (get proposal-type proposal) "fee-change")
+            (begin
+                (asserts! (<= (get target-value proposal) u1000) err-fee-too-high)
+                (var-set platform-fee (get target-value proposal))
+                true
+            )
+            (if (is-eq (get proposal-type proposal) "delay-change")
+                (begin
+                    (var-set withdrawal-delay (get target-value proposal))
+                    true
+                )
+                true
+            )
+        )
+
+        ;; Mark as executed
+        (map-set governance-proposals proposal-id
+            (merge proposal { executed: true })
+        )
+        (ok true)
+    )
+)
+
+;; Governance Management
+(define-public (enable-governance)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set governance-enabled true)
+        (ok true)
+    )
+)
+
+(define-public (update-voting-power
+        (user principal)
+        (power uint)
+    )
+    (let ((permissions (unwrap! (map-get? admin-permissions tx-sender) err-unauthorized)))
+        (asserts!
+            (or (is-eq tx-sender contract-owner) (get can-manage-governance permissions))
+            err-owner-only
+        )
+
+        (map-set user-voting-power user power)
+        (ok true)
+    )
+)
+
+;; Governance Read-only Functions
+(define-read-only (get-governance-proposal (proposal-id uint))
+    (map-get? governance-proposals proposal-id)
+)
+
+(define-read-only (get-user-voting-power (user principal))
+    (default-to u0 (map-get? user-voting-power user))
+)
+
+(define-read-only (get-user-vote
+        (proposal-id uint)
+        (voter principal)
+    )
+    (map-get? proposal-votes {
+        proposal-id: proposal-id,
+        voter: voter,
+    })
+)
+
+(define-read-only (is-governance-enabled)
+    (var-get governance-enabled)
+)
