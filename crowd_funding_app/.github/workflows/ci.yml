@@ -1,0 +1,306 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '18'
+  CLARINET_VERSION: '1.8.0'
+
+jobs:
+  lint:
+    name: 🔍 Code Quality & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+        continue-on-error: false
+
+      - name: Run Prettier check
+        run: npm run format:check
+        continue-on-error: false
+
+  test:
+    name: 🧪 Smart Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Clarinet
+        uses: hirosystems/clarinet-install@v1
+        with:
+          clarinet-version: ${{ env.CLARINET_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Clarity syntax check
+        run: clarinet check
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Generate test coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+  security-audit:
+    name: 🛡️ Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        run: npm audit --audit-level high
+
+      - name: Install Clarinet
+        uses: hirosystems/clarinet-install@v1
+        with:
+          clarinet-version: ${{ env.CLARINET_VERSION }}
+
+      - name: Run Clarity static analysis
+        run: clarinet check --enable-hints
+
+  integration-tests:
+    name: 🔗 Integration Tests
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Clarinet
+        uses: hirosystems/clarinet-install@v1
+        with:
+          clarinet-version: ${{ env.CLARINET_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start local Stacks node
+        run: clarinet integrate &
+
+      - name: Wait for node to be ready
+        run: sleep 30
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+      - name: Stop local node
+        run: pkill -f clarinet || true
+
+  performance-tests:
+    name: ⚡ Performance Tests
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Clarinet
+        uses: hirosystems/clarinet-install@v1
+        with:
+          clarinet-version: ${{ env.CLARINET_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run gas optimization tests
+        run: npm run test:gas
+
+      - name: Generate performance report
+        run: npm run test:performance
+
+  deploy-testnet:
+    name: 🚀 Deploy to Testnet
+    runs-on: ubuntu-latest
+    needs: [lint, test, security-audit, integration-tests]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: testnet
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Clarinet
+        uses: hirosystems/clarinet-install@v1
+        with:
+          clarinet-version: ${{ env.CLARINET_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy to testnet
+        env:
+          STACKS_PRIVATE_KEY: ${{ secrets.TESTNET_PRIVATE_KEY }}
+        run: node scripts/deploy.js testnet
+
+      - name: Post deployment verification
+        run: npm run verify:testnet
+
+      - name: Update deployment status
+        run: echo "Testnet deployment completed at $(date)" >> deployment.log
+
+  deploy-mainnet:
+    name: 🌟 Deploy to Mainnet
+    runs-on: ubuntu-latest
+    needs: [lint, test, security-audit, integration-tests, performance-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: mainnet
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Clarinet
+        uses: hirosystems/clarinet-install@v1
+        with:
+          clarinet-version: ${{ env.CLARINET_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Final security check
+        run: npm run security:full
+
+      - name: Deploy to mainnet
+        env:
+          STACKS_PRIVATE_KEY: ${{ secrets.MAINNET_PRIVATE_KEY }}
+        run: node scripts/deploy.js mainnet
+
+      - name: Initialize contract
+        env:
+          STACKS_PRIVATE_KEY: ${{ secrets.MAINNET_PRIVATE_KEY }}
+        run: npm run initialize:mainnet
+
+      - name: Post deployment verification
+        run: npm run verify:mainnet
+
+      - name: Create release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            🚀 **Mainnet Deployment Successful!**
+            
+            **Changes in this release:**
+            - Smart contract deployed to Stacks mainnet
+            - All tests passing
+            - Security audit completed
+            - Performance optimized
+            
+            **Contract Details:**
+            - Network: Stacks Mainnet
+            - Deployment: ${{ github.sha }}
+            - Timestamp: ${{ github.run_started_at }}
+            
+            **Next Steps:**
+            1. Monitor contract performance
+            2. Initialize categories
+            3. Announce to community
+          draft: false
+          prerelease: false
+
+  notify:
+    name: 📢 Notify Team
+    runs-on: ubuntu-latest
+    needs: [deploy-mainnet]
+    if: always()
+    steps:
+      - name: Notify Slack on success
+        if: needs.deploy-mainnet.result == 'success'
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_MESSAGE: '🎉 Crowdfunding platform successfully deployed to mainnet!'
+          SLACK_TITLE: 'Mainnet Deployment Success'
+          SLACK_COLOR: 'good'
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_MESSAGE: '❌ Deployment pipeline failed. Please check the logs.'
+          SLACK_TITLE: 'Deployment Failure'
+          SLACK_COLOR: 'danger'
+
+  cleanup:
+    name: 🧹 Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy-mainnet, deploy-testnet]
+    if: always()
+    steps:
+      - name: Cleanup temporary files
+        run: |
+          echo "Cleaning up temporary files..."
+          # Add cleanup commands here
+
+      - name: Update documentation
+        if: success()
+        run: |
+          echo "Updating deployment documentation..."
+          # Add documentation update commands here
